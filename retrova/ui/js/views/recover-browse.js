@@ -122,7 +122,7 @@ export function renderFiles(body, S) {
     const s = sizeOf(S, r.path, 'dir');
     if (!s) return h('button.measure', { onclick: () => requestSizes([r.path]) }, 'Measure');
     if (s.state === 'done') return h('span', { title: `${num(s.files)} files${s.errors ? `, ${num(s.errors)} unreadable` : ''}` }, s.errors ? icon('warning', { size: 13, cls: 'warn-text' }) : null, ' ', bytes(s.bytes));
-    if (s.state === 'error') return h('span.bad-text', { title: s.msg || '' }, "Can't measure");
+    if (s.state === 'error' || s.state === 'cancelled') return h('button.measure', { onclick: () => requestSizes([r.path]), title: s.msg || '' }, s.state === 'cancelled' ? 'Stopped' : "Can't measure");
     return h('span.measuring', spinner(12), s.bytes ? bytes(s.bytes) : 'Measuring');
   }
 
@@ -158,7 +158,9 @@ export function renderFiles(body, S) {
 
   async function load(path, { push = true } = {}) {
     ui.loading = true;
-    if (S.showDeleted) clear(status, spinner(13), ' Looking for deleted files. A big drive can take a few minutes the first time.');
+    clear(status, spinner(13), S.showDeleted
+      ? ' Looking for deleted files. A big drive can take a few minutes the first time.'
+      : ' Reading this folder…');
     try {
       const r = await api.get('/api/recover/ls', { sid: S.session.sid, path, ...(S.showDeleted && canDeleted ? { deleted: 1 } : {}) });
       if (push && S.cwd !== r.path) S.history.push(S.cwd);
@@ -193,11 +195,11 @@ export function renderFiles(body, S) {
   function selectAllHere(on = true) {
     for (const r of visible) if (r.kind !== 'other') toggleSel(S, r, on);
     const dirs = visible.filter(r => r.kind === 'dir').map(r => r.path);
-    if (on && dirs.length) requestSizes(dirs.filter(p => S.selection.has(p)));
+    if (on && dirs.length) scheduleSizes(dirs.filter(p => S.selection.has(p)));
     table.refresh(); refreshRows(); renderBasket();
   }
   function afterSelect(r, on) {
-    if (on && r.kind === 'dir' && S.selection.has(r.path)) requestSizes([r.path]);
+    if (on && r.kind === 'dir' && S.selection.has(r.path)) scheduleSizes([r.path]);
     table.refresh(); refreshRows(); renderBasket();
   }
   function measureHere() {
@@ -207,9 +209,24 @@ export function renderFiles(body, S) {
   }
 
   // ---- folder sizes: the engine measures in the background; we poll for answers
+  let sizeKick = null;
+  const sizePending = new Set();
+  function scheduleSizes(paths) {
+    for (const p of paths) sizePending.add(p);
+    clearTimeout(sizeKick);
+    sizeKick = setTimeout(() => {
+      const ready = [...sizePending].filter(p => S.selection.has(p));
+      sizePending.clear();
+      if (ready.length) requestSizes(ready);
+    }, 600);
+  }
   async function requestSizes(paths) {
     const pk = patKey(S);
-    for (const p of paths) if (!S.sizes.has(p + '|' + pk)) S.sizes.set(p + '|' + pk, { state: 'queued', bytes: 0, files: 0 });
+    for (const p of paths) {
+      const k = p + '|' + pk;
+      const cur = S.sizes.get(k);
+      if (!cur || cur.state === 'cancelled' || cur.state === 'error') S.sizes.set(k, { state: 'queued', bytes: 0, files: 0 });
+    }
     table.refresh();
     await pollSizes(paths);
   }
@@ -226,8 +243,13 @@ export function renderFiles(body, S) {
     table.refresh();
     renderBasket();
   }
+  async function cancelSizes() {
+    for (const [k, v] of S.sizes) if (v.state === 'queued' || v.state === 'running') S.sizes.set(k, { state: 'cancelled', bytes: 0, files: 0 });
+    try { await api.post('/api/recover/size', { sid: S.session.sid, cancel: true }); } catch { /* engine may be gone */ }
+    table.refresh(); refreshRows(); renderBasket();
+  }
   const sizeTimer = setInterval(() => pollSizes(), 1000);
-  onDispose(() => clearInterval(sizeTimer));
+  onDispose(() => { clearInterval(sizeTimer); clearTimeout(sizeKick); });
 
   function preview(r) {
     previewSheet({ name: r.name, url: previewUrl(S.session.sid, r.path), size: r.size, path: r.path });
@@ -298,7 +320,9 @@ export function renderFiles(body, S) {
   function renderBasket() {
     if (!basket.isConnected) return;
     const t = totals();
-    clear(totalBox, S.selection.size ? h('span.num', { text: bytes(t.total) }) : null);
+    const measuring = [...S.sizes.values()].some(v => v.state === 'queued' || v.state === 'running');
+    clear(totalBox, S.selection.size ? h('span.num', { text: bytes(t.total) }) : null,
+      measuring ? h('button.btn.link.sm', { onclick: cancelSizes, title: 'Stop working out folder sizes' }, 'Stop measuring') : null);
     // list
     if (!S.selection.size) {
       clear(listBox, h('div.bk-empty', icon('check'), h('span', 'Tick the folders and files you want back. Ticking a folder takes everything in it.')));

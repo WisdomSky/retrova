@@ -239,14 +239,83 @@ class ApfsView(FSView):
 
     def iterdir(self, node):
         from .apfs_engine import dirent_kind
-        for e in node.obj.iterdir():
+        obj = node.obj
+        if obj is None:
+            oid, sib = node.handle
+            obj = self.v.inode(oid, sib)       # a row from the bulk listing has no INode object yet
+        entries = []
+        try:
+            for e in obj.iterdir():
+                name = getattr(e, "name", "?")
+                try:
+                    entries.append((name, dirent_kind(e), int(e.file_id),
+                                    None if e.sibling_id is None else int(e.sibling_id), e, None))
+                except Exception as ex:
+                    entries.append((name, "other", None, None, e, ex))
+        except Exception as ex:
+            yield Node("?", "other", error=f"{type(ex).__name__}: {ex}")
+            return
+        metas = self._bulk_meta(entries) if len(entries) >= self._BULK_MIN else {}
+        for name, k, fid, sib, e, err in entries:
+            if err is not None:
+                yield Node(name, "other", error=f"{type(err).__name__}: {err}")
+                continue
+            if fid is not None and sib is None and fid in metas:
+                size, mt, at, mode = metas[fid]
+                yield Node(name, k, size if k == "file" else 0, mt, at, mode & 0o7777, (fid, None))
+                continue
             try:
-                k = dirent_kind(e)
                 ino = e.inode
             except Exception as ex:
-                yield Node(getattr(e, "name", "?"), "other", error=f"{type(ex).__name__}: {ex}")
+                yield Node(name, k or "other", error=f"{type(ex).__name__}: {ex}")
                 continue
-            yield self._node(e.name, ino, k, e.file_id, e.sibling_id)
+            yield self._node(name, ino, k, fid, sib)
+
+    _BULK_MIN = 512
+
+    def _bulk_meta(self, entries) -> dict:
+        """Read the inode details for a big folder in one pass over the filesystem tree.
+
+        Each e.inode in a directory is a separate B-tree search. When a folder has many
+        thousands of files whose inode numbers sit close together (the usual case), walking
+        that range once is several times faster. Sparse ranges and odd entries fall back to
+        the normal per-file lookup, so the result is the same either way."""
+        ids = {fid for _, k, fid, sib, e, err in entries
+               if err is None and sib is None and fid is not None}
+        if len(ids) < self._BULK_MIN:
+            return {}
+        lo, hi = min(ids), max(ids)
+        if hi - lo + 1 > max(len(ids) * 4, 4096):
+            return {}
+        from dissect.apfs.c_apfs import c_apfs
+        from dissect.apfs.objects.fs import cmp_fs
+        found = {}
+        limit = len(ids) * 8 + 1024
+        try:
+            cur = self.v.cursor()
+            cur.search((lo, c_apfs.APFS_TYPE.INODE.value), cmp=cmp_fs)
+        except Exception:
+            return {}
+        for _ in range(limit):
+            try:
+                # j_key is one little-endian uint64: object id in the low bits, record type on top.
+                key = int.from_bytes(cur.key()[:8], "little")
+                oid = key & c_apfs.OBJ_ID_MASK
+                typ = (key & c_apfs.OBJ_TYPE_MASK) >> c_apfs.OBJ_TYPE_SHIFT
+            except Exception:
+                break
+            if oid > hi:
+                break
+            if oid in ids and typ == c_apfs.APFS_TYPE.INODE.value:
+                meta = _apfs_inode_meta(cur.value())
+                if meta is not None:
+                    found[oid] = meta
+            try:
+                if not cur.next():
+                    break
+            except Exception:
+                break
+        return found
 
     def open_handle(self, handle):
         oid, sib = handle
@@ -255,6 +324,30 @@ class ApfsView(FSView):
     def readlink(self, handle):
         oid, sib = handle
         return self.v.inode(oid, sib).readlink()
+
+
+def _apfs_inode_meta(raw):
+    """(size, mtime_ns, atime_ns, mode) from one raw APFS inode record, or None when the
+    entry needs the full INode parser (compressed data, a missing data stream, …)."""
+    from dissect.apfs.c_apfs import c_apfs
+    from dissect.apfs.objects.fs import XF_MAP, _read_xfields
+    try:
+        ino = c_apfs.j_inode_val(raw)
+        if ino.bsd_flags & c_apfs.UF_COMPRESSED:
+            return None
+        if c_apfs.INODE.HAS_UNCOMPRESSED_SIZE in c_apfs.INODE(ino.internal_flags):
+            size = ino.uncompressed_size
+        else:
+            size = 0
+            extra = raw[len(c_apfs.j_inode_val):]
+            if extra:
+                for field, data in _read_xfields(extra):
+                    if field.x_type == c_apfs.INO_EXT_TYPE.DSTREAM:
+                        size = XF_MAP[c_apfs.INO_EXT_TYPE.DSTREAM](data).size
+                        break
+        return int(size), int(ino.mod_time), int(ino.access_time), int(ino.mode)
+    except Exception:
+        return None
 
 
 # ====================================================================== NTFS

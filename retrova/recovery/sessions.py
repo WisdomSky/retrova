@@ -8,6 +8,7 @@ import queue
 import threading
 import time
 import uuid
+from collections import OrderedDict
 
 from .common import excluded, is_device_path, join_src, norm_src
 from .fsview import open_view
@@ -126,6 +127,8 @@ class Session:
         self.info = info
         self.used = time.time()
         self.closed = False
+        self._ls_cache: OrderedDict = OrderedDict()
+        self._ls_cache_rows = 0
 
     @property
     def source(self):
@@ -150,7 +153,12 @@ class Session:
         notes = []
         if can and (deleted or in_tree):
             notes = self.view.deleted_index().notes        # the first time this walks the disk: do it before the lock
+        key = (path, bool(deleted))
         with self.lock:
+            cached = self._ls_cache.get(key)
+            if cached is not None:
+                self._ls_cache.move_to_end(key)
+                return cached
             node = self.view.resolve(path)
             if node.kind != "dir":
                 raise NotADirectoryError(f"{path} is a file, not a folder.")
@@ -162,11 +170,22 @@ class Session:
                          if c.kind != "dir" or c.name.casefold() not in live]
                 if path == "/":
                     rows.append(self._row("/", self.view.root_node(), True))
-        rows.sort(key=lambda r: (r["kind"] != "dir", r["name"].lower()))
-        out = {"path": path, "entries": rows}
-        if notes:
-            out["deleted_notes"] = list(notes)
-        return out
+            rows.sort(key=lambda r: (r["kind"] != "dir", r["name"].lower()))
+            out = {"path": path, "entries": rows}
+            if notes:
+                out["deleted_notes"] = list(notes)
+            self._cache_ls(key, out)
+            return out
+
+    def _cache_ls(self, key, out):
+        """Keep recently listed folders (the source is read-only, so they can't go stale). Makes
+        stepping back and forth through big folders instant; bounded so memory stays modest."""
+        self._ls_cache[key] = out
+        self._ls_cache_rows += len(out.get("entries") or [])
+        self._ls_cache.move_to_end(key)
+        while len(self._ls_cache) > 64 or self._ls_cache_rows > 200_000:
+            _, old = self._ls_cache.popitem(last=False)
+            self._ls_cache_rows -= len(old.get("entries") or [])
 
     @staticmethod
     def _row(parent, c, deleted):
@@ -186,6 +205,8 @@ class Session:
             return
         self.closed = True
         self.sizes.close()
+        self._ls_cache.clear()
+        self._ls_cache_rows = 0
         with self.lock:
             try:
                 self.view.close()

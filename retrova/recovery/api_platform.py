@@ -99,7 +99,7 @@ def _wait_for(port, token, timeout):
     while time.time() < end:
         if _answers(port, token):
             return True
-        time.sleep(0.3)
+        time.sleep(0.15)
     return False
 
 
@@ -127,14 +127,22 @@ def _discard_token_file(path: str):
     shutil.rmtree(os.path.dirname(path), ignore_errors=True)
 
 
-# The helper must leave the process group of `do shell script`: macOS keeps the AppleScript
-# command waiting until every process that inherited its pipes is gone, even with nohup and `&`.
-# Double-fork + setsid + closing the inherited descriptors detaches it, so the password prompt
-# returns as soon as the helper is running.
+# Detach the helper in Python itself without `/usr/bin/nohup`:
+# 1. Under `do shell script ... with administrator privileges` (com.apple.security.authtrampoline),
+#    macOS's `/usr/bin/nohup` calls `_vprocmgr_detach_from_console(0)`, which fails in the system
+#    launchd domain ("Could not adopt Background session: 125") and exits 127 without ever exec'ing
+#    Python.
+# 2. `osascript` and `authtrampoline` also pass open pipes (stdout, stderr, and auth fd 5) and wait
+#    until every process holding them closes them. Ignoring SIGHUP, closing fds >= 3, redirecting
+#    stdio to /dev/null and double-forking with setsid() lets `osascript` return as soon as the
+#    password is accepted.
 _MAC_DAEMON = (
-    "import os,sys; p,tf,par=sys.argv[1:4]; pid=os.fork(); pid and os._exit(0); "
-    "os.setsid(); pid=os.fork(); pid and os._exit(0); os.closerange(3,65536); "
-    "fd=os.open(os.devnull,os.O_RDWR); os.dup2(fd,0); os.dup2(fd,1); os.dup2(fd,2); "
+    "import os,signal,sys; p,tf,par=sys.argv[1:4]; "
+    "signal.signal(signal.SIGHUP,signal.SIG_IGN); "
+    "os.closerange(3,65536); "
+    "fd=os.open(os.devnull,os.O_RDWR); os.dup2(fd,0); os.dup2(fd,1); os.dup2(fd,2); os.close(fd); "
+    "pid=os.fork(); pid and os._exit(0); "
+    "os.setsid(); pid=os.fork(); pid and os._exit(0); "
     'os.execv(sys.executable,[sys.executable,"-m","retrova","--serve-only","--port",p,'
     '"--token-file",tf,"--parent",par])'
 )
@@ -143,9 +151,8 @@ _MAC_DAEMON = (
 def _launch_mac(port, token_file):
     env = (f"SUDO_UID={int(REAL_UID)} SUDO_GID={int(REAL_GID)} SUDO_USER={shlex.quote(REAL_USER)} "
            f"RETROVA_ELEVATED=1 RETROVA_APP_DATA={shlex.quote(_app_data())}")
-    cmd = (f"cd {shlex.quote(PKG_ROOT)} && {env} nohup {shlex.quote(sys.executable)} "
-           f"-c {shlex.quote(_MAC_DAEMON)} {port} {shlex.quote(token_file)} {os.getpid()} "
-           f">/dev/null 2>&1 &")
+    cmd = (f"cd {shlex.quote(PKG_ROOT)} && {env} {shlex.quote(sys.executable)} "
+           f"-c {shlex.quote(_MAC_DAEMON)} {port} {shlex.quote(token_file)} {os.getpid()}")
     script = (f"do shell script {_applescript_quote(cmd)} with prompt "
               f"{_applescript_quote('Retrova needs administrator rights to read the drive directly. It only ever reads it.')}"
               f" with administrator privileges")

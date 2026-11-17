@@ -159,6 +159,26 @@ def test_apfs_compressed_files_and_links():
         assert v.resolve("/DIR/FILE").size == 16
 
 
+def test_apfs_bulk_listing_matches_normal(monkeypatch):
+    """Large APFS folders are read through a bulk inode pass; it must return exactly the same
+    rows as the per-file path (including compressed files and hard links, which fall back)."""
+    import retrova.recovery.fsview as fv
+    path = os.path.join(APFS_DIR, "jhfs_converted.bin")
+
+    def snapshot():
+        with open_view({"source": path, "offset": 0}) as v:
+            files, dirs, links, errors = walk(v)
+            return ({
+                rel: (n.kind, n.size, n.mtime_ns, n.handle) for rel, n in files.items()
+            }, sorted(dirs), {
+                rel: (v.readlink(n.handle), n.handle) for rel, n in links.items()
+            }, errors)
+
+    normal = snapshot()
+    monkeypatch.setattr(fv.ApfsView, "_BULK_MIN", 1)
+    assert snapshot() == normal
+
+
 def test_apfs_gpt_volume_selection():
     path = os.path.join(APFS_DIR, "gptdisk.img")
     with open_view({"source": path, "offset": 4194304, "volume": "Snapshots"}) as v:
