@@ -1,8 +1,8 @@
 name: Release build
 
-# Builds every Retrova installer from the checked-in source on a clean GitHub runner and records a signed
-# build attestation (provenance) for each file, so anyone can check that a download came from this repository.
-# It only builds. Publishing a release stays a manual step.
+# Builds every Retrova installer from the checked-in source on a clean GitHub runner, records a signed
+# build attestation (provenance) for each file, and — on a v* tag — publishes a GitHub release with
+# all the installers and SHA256SUMS attached. Manual/branch runs only build and upload the artifact.
 
 on:
   workflow_dispatch:
@@ -23,6 +23,24 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify release tag matches app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          text = open("retrova/__init__.py", encoding="utf-8").read()
+          match = re.search(r"""__version__\s*=\s*['"]([^'"]+)['"]""", text)
+          if not match:
+              raise SystemExit("could not read retrova.__version__")
+          version = match.group(1)
+          if tag.lstrip("v") != version:
+              raise SystemExit(f"tag {tag} does not match retrova.__version__ {version}")
+          print(f"tag {tag} matches version {version}")
+          PY
 
       - name: Build tools
         run: |
@@ -54,3 +72,36 @@ jobs:
           name: retrova-installers
           path: dist/
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write       # create the release and upload its assets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: retrova-installers
+          path: dist/
+
+      - name: List release assets
+        run: |
+          cd dist
+          ls -l
+          cat SHA256SUMS
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          assets=(dist/*)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # A re-run of the workflow: replace the assets rather than failing on an existing release.
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --title "Retrova $tag" --generate-notes
+          fi
