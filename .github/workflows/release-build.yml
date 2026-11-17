@@ -1,11 +1,17 @@
 name: Release build
 
 # Builds every Retrova installer from the checked-in source on a clean GitHub runner, records a signed
-# build attestation (provenance) for each file, and — on a v* tag — publishes a GitHub release with
-# all the installers and SHA256SUMS attached. Manual/branch runs only build and upload the artifact.
+# build attestation (provenance) for each file, and publishes a GitHub release with all the installers
+# and SHA256SUMS attached — both on a v* tag push and on a manual "Run workflow" dispatch.
+# ci/** branch pushes only build and upload the CI artifact.
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v1.1.4). Leave blank to use retrova.__version__."
+        required: false
+        type: string
   push:
     tags: ["v*"]
     branches: ["ci/**"]
@@ -17,6 +23,8 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.tag }}
     permissions:
       contents: read
       id-token: write       # lets GitHub sign the attestation
@@ -24,22 +32,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify release tag matches app version
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Determine and verify release tag
+        id: release_tag
+        env:
+          RELEASE_TAG_INPUT: ${{ github.event.inputs.tag }}
         run: |
           python3 - <<'PY'
           import os
           import re
 
-          tag = os.environ["GITHUB_REF_NAME"]
           text = open("retrova/__init__.py", encoding="utf-8").read()
           match = re.search(r"""__version__\s*=\s*['"]([^'"]+)['"]""", text)
           if not match:
               raise SystemExit("could not read retrova.__version__")
           version = match.group(1)
+
+          event = os.environ["GITHUB_EVENT_NAME"]
+          if event == "workflow_dispatch":
+              # Manual run: use the typed tag, or fall back to the version in the source.
+              tag = os.environ.get("RELEASE_TAG_INPUT", "").strip() or "v" + version
+          else:
+              tag = os.environ["GITHUB_REF_NAME"]
+
           if tag.lstrip("v") != version:
-              raise SystemExit(f"tag {tag} does not match retrova.__version__ {version}")
-          print(f"tag {tag} matches version {version}")
+              raise SystemExit(f"release tag {tag} does not match retrova.__version__ {version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"tag={tag}\n")
+          print(f"release tag: {tag} (version {version}, event {event})")
           PY
 
       - name: Build tools
@@ -76,7 +95,7 @@ jobs:
   release:
     name: Publish GitHub release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     permissions:
       contents: write       # create the release and upload its assets
@@ -95,13 +114,17 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
           assets=(dist/*)
           if gh release view "$tag" >/dev/null 2>&1; then
             # A re-run of the workflow: replace the assets rather than failing on an existing release.
             gh release upload "$tag" "${assets[@]}" --clobber
           else
-            gh release create "$tag" "${assets[@]}" --title "Retrova $tag" --generate-notes
+            gh release create "$tag" "${assets[@]}" \
+              --target "${GITHUB_SHA}" \
+              --title "Retrova $tag" \
+              --generate-notes
           fi
