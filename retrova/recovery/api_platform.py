@@ -127,11 +127,25 @@ def _discard_token_file(path: str):
     shutil.rmtree(os.path.dirname(path), ignore_errors=True)
 
 
+# The helper must leave the process group of `do shell script`: macOS keeps the AppleScript
+# command waiting until every process that inherited its pipes is gone, even with nohup and `&`.
+# Double-fork + setsid + closing the inherited descriptors detaches it, so the password prompt
+# returns as soon as the helper is running.
+_MAC_DAEMON = (
+    "import os,sys; p,tf,par=sys.argv[1:4]; pid=os.fork(); pid and os._exit(0); "
+    "os.setsid(); pid=os.fork(); pid and os._exit(0); os.closerange(3,65536); "
+    "fd=os.open(os.devnull,os.O_RDWR); os.dup2(fd,0); os.dup2(fd,1); os.dup2(fd,2); "
+    'os.execv(sys.executable,[sys.executable,"-m","retrova","--serve-only","--port",p,'
+    '"--token-file",tf,"--parent",par])'
+)
+
+
 def _launch_mac(port, token_file):
     env = (f"SUDO_UID={int(REAL_UID)} SUDO_GID={int(REAL_GID)} SUDO_USER={shlex.quote(REAL_USER)} "
            f"RETROVA_ELEVATED=1 RETROVA_APP_DATA={shlex.quote(_app_data())}")
-    cmd = (f"cd {shlex.quote(PKG_ROOT)} && {env} nohup {shlex.quote(sys.executable)} -m retrova --serve-only "
-           f"--port {port} --token-file {shlex.quote(token_file)} --parent {os.getpid()} >/dev/null 2>&1 &")
+    cmd = (f"cd {shlex.quote(PKG_ROOT)} && {env} nohup {shlex.quote(sys.executable)} "
+           f"-c {shlex.quote(_MAC_DAEMON)} {port} {shlex.quote(token_file)} {os.getpid()} "
+           f">/dev/null 2>&1 &")
     script = (f"do shell script {_applescript_quote(cmd)} with prompt "
               f"{_applescript_quote('Retrova needs administrator rights to read the drive directly. It only ever reads it.')}"
               f" with administrator privileges")
