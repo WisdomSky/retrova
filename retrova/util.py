@@ -126,7 +126,12 @@ def to_trash(paths) -> dict:
                 # Refuse up front: Windows deletes permanently when a drive has no Recycle Bin.
                 failed.append({"path": p, "error": why})
                 continue
-            if send2trash is not None:
+            if IS_MAC and is_admin() and REAL_UID and REAL_UID != 0:
+                # The elevated engine runs as root. send2trash/NSFileManager would use root's
+                # Trash (/var/root/.Trash), which the user's Finder/Dock never shows. Put things
+                # in the real user's Trash instead, with their ownership restored.
+                _mac_trash_as_user(p)
+            elif send2trash is not None:
                 send2trash(p)
             elif IS_MAC:
                 _mac_trash(p)
@@ -171,6 +176,46 @@ def _mac_trash(p):
     r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if r.returncode:
         raise OSError(r.stderr.strip() or "Finder refused")
+
+
+def _mac_trash_as_user(p):
+    """Move an item into the real user's Trash when Retrova runs as root.
+
+    Finder's Trash is just ~/.Trash for items on the startup disk, so a plain move there is
+    enough and it shows up in the Dock immediately. Ownership has to be reset on the whole
+    tree, otherwise Finder can't empty it later."""
+    trash = os.path.join(REAL_HOME, ".Trash")
+    makedirs_owned(trash)
+    base = os.path.basename(os.path.normpath(p)) or "Untitled"
+    target = _unique_trash_name(os.path.join(trash, base))
+    shutil.move(p, target)
+    _give_tree_to_user(target)
+    return target
+
+
+def _unique_trash_name(path):
+    if not os.path.lexists(path):
+        return path
+    n = 2
+    while os.path.lexists(f"{path}.retrova-{n}"):
+        n += 1
+    return f"{path}.retrova-{n}"
+
+
+def _give_tree_to_user(path):
+    if not REAL_UID or REAL_UID == os.getuid():
+        return
+    if os.path.isdir(path) and not os.path.islink(path):
+        for root, dirs, files in os.walk(path, followlinks=False):
+            for name in dirs + files:
+                try:
+                    os.lchown(os.path.join(root, name), REAL_UID, REAL_GID)
+                except OSError:
+                    pass
+    try:
+        os.lchown(path, REAL_UID, REAL_GID)
+    except OSError:
+        pass
 
 
 def reveal(path: str):
